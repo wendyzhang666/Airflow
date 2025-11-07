@@ -1,0 +1,632 @@
+"""
+HR Data Migration Pipeline: PeopleSoft to Redshift
+===================================================
+
+Learning Project: 10-year HR data migration using Medallion Architecture
+
+Architecture:
+- Bronze Layer: Raw data from PeopleSoft
+- Silver Layer: Cleaned and standardized data  
+- Gold Layer: Business-ready analytics tables
+
+# ========================================
+# Default Arguments
+# ========================================
+default_args = {
+    'owner': 'wendy',
+    'depends_on_past': False,
+    'email': ['hr-data-team@stanford.edu'],
+    'email_on_failure': True,
+    'email_on_retry': False,
+    'retries': 3,
+    'retry_delay': timedelta(minutes=5),
+    'execution_timeout': timedelta(hours=4),
+}
+
+# ========================================
+# DAG Definition
+# ========================================
+dag = DAG(
+    'hr_peoplesoft_to_redshift_migration',
+    default_args=default_args,
+    description='Migrate 10 years of HR data: PeopleSoft → Redshift (Bronze/Silver/Gold)',
+    schedule_interval=None,  # One-time migration, manually triggered
+    start_date=datetime(2024, 1, 1),
+    catchup=False,
+    tags=['hr', 'migration', 'peoplesoft', 'redshift', 'learning'],
+)
+
+# ========================================
+# Phase 1: Extract Data from PeopleSoft
+# ========================================
+
+def extract_employee_data(**context):
+    """
+    Extract 10 years of employee data from PeopleSoft
+    
+    Strategy: Extract by year to avoid timeout
+    Output: Save to S3 as Parquet (Bronze layer)
+    """
+    print("Extracting employee data from PeopleSoft...")
+    
+    total_records = 100000  
+    s3_path = 's3://stanford-hr-data/bronze/employees/raw_employees.parquet'
+    
+    # Push statistics to XComs for downstream tasks
+    context['ti'].xcom_push(key='total_records', value=total_records)
+    context['ti'].xcom_push(key='s3_path', value=s3_path)
+    
+    print(f"✅ Extracted {total_records:,} employee records")
+    print(f"📍 Saved to: {s3_path}")
+    
+    return s3_path
+
+def extract_department_data(**context):
+    """
+    Extract department dimension data from PeopleSoft
+    """
+    print("Extracting department data from PeopleSoft...")
+    
+    department_count = 50  
+    s3_path = 's3://stanford-hr-data/bronze/departments/raw_departments.parquet'
+    
+    context['ti'].xcom_push(key='department_count', value=department_count)
+    
+    print(f"✅ Extracted {department_count} departments")
+    return s3_path
+
+def extract_job_codes(**context):
+    """
+    Extract job code dimension data from PeopleSoft
+    
+    Note: Includes both active and retired job codes
+    """
+    print("Extracting job codes from PeopleSoft...")
+    
+    active_count = 200 
+    retired_count = 50  
+    total = active_count + retired_count
+    s3_path = 's3://stanford-hr-data/bronze/job_codes/raw_job_codes.parquet'
+    
+    context['ti'].xcom_push(key='job_codes_count', value=total)
+    context['ti'].xcom_push(key='active_count', value=active_count)
+    context['ti'].xcom_push(key='retired_count', value=retired_count)
+    
+    print(f"✅ Extracted {total} job codes (Active: {active_count}, Retired: {retired_count})")
+    return s3_path
+
+# Define extraction tasks (3 parallel tasks)
+extract_employees = PythonOperator(
+    task_id='extract_employees',
+    python_callable=extract_employee_data,
+    dag=dag
+)
+
+extract_departments = PythonOperator(
+    task_id='extract_departments',
+    python_callable=extract_department_data,
+    dag=dag
+)
+
+extract_jobs = PythonOperator(
+    task_id='extract_job_codes',
+    python_callable=extract_job_codes,
+    dag=dag
+)
+
+# ========================================
+# Phase 2: Data Quality Check (Bronze Layer)
+# ========================================
+
+def validate_bronze_data(**context):
+    """
+    Validate Bronze layer data quality
+    
+    Checks:
+    - Null values in critical fields
+    - Duplicate records
+    - Date logic consistency
+    - Salary range validation
+    """
+    print("=" * 60)
+    print("📊 BRONZE LAYER DATA QUALITY CHECK")
+    print("=" * 60)
+    
+    # Simulated validation results
+    issues = []
+    
+    # Example checks (in real implementation: query actual data)
+    null_check = 0  # No nulls found
+    duplicates = 0  # No duplicates
+    invalid_dates = 5  # 5 records with date issues
+    
+    if invalid_dates > 0:
+        issues.append(f"⚠️  {invalid_dates} records have invalid date logic")
+    
+    # Generate report
+    total_records = context['ti'].xcom_pull(task_ids='extract_employees', key='total_records')
+    
+    report = {
+        'total_records': total_records,
+        'issues_found': len(issues),
+        'validation_status': 'PASSED' if len(issues) == 0 else 'WARNING'
+    }
+    
+    print(f"Total records: {total_records:,}")
+    print(f"Issues found: {len(issues)}")
+    
+validate_bronze = PythonOperator(
+    task_id='validate_bronze',
+    python_callable=validate_bronze_data,
+    dag=dag
+)
+
+# ========================================
+# Phase 3: Load Bronze Layer to Redshift
+# ========================================
+
+load_bronze_employees = S3ToRedshiftOperator(
+    task_id='load_bronze_employees',
+    s3_bucket='stanford-hr-data',
+    s3_key='bronze/employees/raw_employees.parquet',
+    schema='bronze',
+    table='raw_employees',
+    copy_options=['FORMAT AS PARQUET'],
+    redshift_conn_id='redshift_default',
+    method='REPLACE',
+    dag=dag
+)
+
+load_bronze_departments = S3ToRedshiftOperator(
+    task_id='load_bronze_departments',
+    s3_bucket='stanford-hr-data',
+    s3_key='bronze/departments/raw_departments.parquet',
+    schema='bronze',
+    table='raw_departments',
+    copy_options=['FORMAT AS PARQUET'],
+    redshift_conn_id='redshift_default',
+    method='REPLACE',
+    dag=dag
+)
+
+load_bronze_jobs = S3ToRedshiftOperator(
+    task_id='load_bronze_jobs',
+    s3_bucket='stanford-hr-data',
+    s3_key='bronze/job_codes/raw_job_codes.parquet',
+    schema='bronze',
+    table='raw_job_codes',
+    copy_options=['FORMAT AS PARQUET'],
+    redshift_conn_id='redshift_default',
+    method='REPLACE',
+    dag=dag
+)
+
+# ========================================
+# Phase 4: Create Silver Layer (Cleaned Data)
+# ========================================
+
+# SQL for Silver employees (simplified for learning)
+silver_employees_sql = """
+-- Clean and standardize employee data
+CREATE TABLE silver.employees AS (
+    SELECT 
+        employee_id,
+        TRIM(full_name) as full_name,
+        department_id,
+        job_code,
+        hire_date,
+        termination_date,
+        annual_salary,
+        
+        -- Standardize employment status
+        CASE 
+            WHEN employment_status IN ('A', 'Active') THEN 'Active'
+            WHEN employment_status IN ('T', 'Terminated') THEN 'Terminated'
+            ELSE 'Unknown'
+        END as employment_status,
+        
+        CURRENT_TIMESTAMP as loaded_at
+        
+    FROM bronze.raw_employees
+    WHERE employee_id IS NOT NULL
+);
+
+"""
+create_silver_employees = PostgresOperator(
+    task_id='create_silver_employees',
+    postgres_conn_id='redshift_default',
+    sql=silver_employees_sql,
+    dag=dag
+)
+
+# SQL for Silver departments (simplified)
+silver_departments_sql = """
+-- Clean department data
+CREATE TABLE silver.departments AS (
+    SELECT DISTINCT
+        department_id,
+        TRIM(department_name) as department_name,
+        location,
+        CURRENT_TIMESTAMP as loaded_at
+    FROM bronze.raw_departments
+    WHERE department_id IS NOT NULL
+);
+
+CREATE INDEX idx_silver_departments_id ON silver.departments(department_id);
+"""
+
+create_silver_departments = PostgresOperator(
+    task_id='create_silver_departments',
+    postgres_conn_id='redshift_default',
+    sql=silver_departments_sql,
+    dag=dag
+)
+
+# SQL for Silver job codes (filter retired jobs)
+silver_jobs_sql = """
+-- Filter job codes: keep active + recently retired (within 2 years)
+CREATE TABLE silver.job_codes AS (
+    SELECT 
+        job_code,
+        TRIM(job_description) as job_description,
+        job_family,
+        salary_grade,
+        status,
+        
+        -- Flag for active jobs
+        CASE 
+            WHEN status = 'Active' THEN TRUE 
+            ELSE FALSE 
+        END as is_active,
+        
+        CURRENT_TIMESTAMP as loaded_at
+        
+    FROM bronze.raw_job_codes
+    WHERE job_code IS NOT NULL
+    -- Keep active + jobs retired within last 2 years
+    AND (
+        status = 'Active' 
+        OR (status = 'Retired' AND end_date >= DATEADD(year, -2, CURRENT_DATE))
+    )
+);
+
+CREATE INDEX idx_silver_jobs_code ON silver.job_codes(job_code);
+"""
+
+create_silver_jobs = PostgresOperator(
+    task_id='create_silver_job_codes',
+    postgres_conn_id='redshift_default',
+    sql=silver_jobs_sql,
+    dag=dag
+)
+
+# ========================================
+# Phase 5: Create Gold Layer (Business Analytics)
+# ========================================
+
+# SQL for Gold employee summary (denormalized)
+gold_employee_summary_sql = """
+-- Business-ready employee summary
+CREATE TABLE gold.employee_summary AS (
+    SELECT 
+        e.employee_id,
+        e.full_name,
+        e.hire_date,
+        e.termination_date,
+        e.employment_status,
+        e.tenure_years,
+        e.annual_salary,
+        
+        -- Department info
+        d.department_name,
+        d.location as department_location,
+        
+        -- Job info
+        j.job_description,
+        j.job_family,
+        j.salary_grade,
+        
+        -- Business categorizations
+        CASE 
+            WHEN e.tenure_years < 1 THEN 'New Hire (<1 year)'
+            WHEN e.tenure_years < 3 THEN 'Early Career (1-3 years)'
+            WHEN e.tenure_years < 10 THEN 'Experienced (3-10 years)'
+            ELSE 'Veteran (10+ years)'
+        END as tenure_category,
+        
+        CASE 
+            WHEN e.annual_salary < 50000 THEN 'Entry Level'
+            WHEN e.annual_salary < 100000 THEN 'Mid Level'
+            WHEN e.annual_salary < 200000 THEN 'Senior Level'
+            ELSE 'Executive Level'
+        END as salary_band,
+        
+        CURRENT_DATE as report_date
+        
+    FROM silver.employees e
+    LEFT JOIN silver.departments d ON e.department_id = d.department_id
+    LEFT JOIN silver.job_codes j ON e.job_code = j.job_code
+);
+
+CREATE INDEX idx_gold_employee_id ON gold.employee_summary(employee_id);
+"""
+
+create_gold_employee_summary = PostgresOperator(
+    task_id='create_gold_employee_summary',
+    postgres_conn_id='redshift_default',
+    sql=gold_employee_summary_sql,
+    dag=dag
+)
+
+# SQL for Gold department metrics (aggregated)
+gold_department_metrics_sql = """
+-- Department-level HR metrics
+CREATE TABLE gold.department_metrics AS (
+    SELECT 
+        department_name,
+        
+        -- Headcount
+        COUNT(*) as total_headcount,
+        COUNT(CASE WHEN employment_status = 'Active' THEN 1 END) as active_headcount,
+        
+        -- Tenure analysis
+        AVG(tenure_years) as avg_tenure_years,
+        
+        -- Compensation analysis
+        AVG(annual_salary) as avg_salary,
+        SUM(annual_salary) as total_payroll,
+        
+        CURRENT_DATE as report_date
+        
+    FROM gold.employee_summary
+    GROUP BY department_name
+);
+"""
+
+create_gold_department_metrics = PostgresOperator(
+    task_id='create_gold_department_metrics',
+    postgres_conn_id='redshift_default',
+    sql=gold_department_metrics_sql,
+    dag=dag
+)
+
+# ========================================
+# Phase 6: Validate Gold Layer
+# ========================================
+
+def validate_gold_layer(**context):
+    """
+    Validate Gold layer data integrity
+    
+    Checks:
+    - Record count consistency
+    - Null values
+    - Business logic validation
+    """
+    print("=" * 60)
+    print("📊 GOLD LAYER VALIDATION")
+    print("=" * 60)
+    
+    # Simulated validation (in real implementation: query Redshift)
+    bronze_count = context['ti'].xcom_pull(task_ids='extract_employees', key='total_records')
+    silver_count = bronze_count  # Assume same after cleaning
+    gold_count = silver_count    # Should match Silver
+    
+    print(f"Bronze records: {bronze_count:,}")
+    print(f"Silver records: {silver_count:,}")
+    print(f"Gold records: {gold_count:,}")
+    
+    # Validation checks
+    if gold_count == silver_count:
+        print("\n✅ Record count validation passed!")
+    else:
+        print(f"\n❌ Record count mismatch!")
+    
+    print("=" * 60)
+    
+    validation_result = {
+        'bronze_count': bronze_count,
+        'silver_count': silver_count,
+        'gold_count': gold_count,
+        'validation_status': 'PASSED'
+    }
+    
+    context['ti'].xcom_push(key='validation_result', value=validation_result)
+    
+    return validation_result
+
+validate_gold = PythonOperator(
+    task_id='validate_gold',
+    python_callable=validate_gold_layer,
+    dag=dag
+)
+
+# ========================================
+# Phase 7: Create Tableau Views
+# ========================================
+
+tableau_views_sql = """
+-- View for Tableau: Current employees
+CREATE OR REPLACE VIEW tableau.current_employees AS
+SELECT * FROM gold.employee_summary
+WHERE employment_status = 'Active';
+
+-- View for Tableau: Department dashboard
+CREATE OR REPLACE VIEW tableau.department_dashboard AS
+SELECT * FROM gold.department_metrics;
+
+-- View for Tableau: Tenure analysis
+CREATE OR REPLACE VIEW tableau.tenure_dashboard AS
+SELECT * FROM gold.tenure_analysis;
+"""
+
+create_tableau_views = PostgresOperator(
+    task_id='create_tableau_views',
+    postgres_conn_id='redshift_default',
+    sql=tableau_views_sql,
+    dag=dag
+)
+
+# ========================================
+# Phase 8: Refresh Tableau & Send Report
+# ========================================
+
+refresh_tableau = BashOperator(
+    task_id='refresh_tableau',
+    bash_command='echo "Refreshing Tableau dashboards..." && echo "✅ Tableau refresh completed"',
+    dag=dag
+)
+
+def generate_migration_report(**context):
+    """
+    Generate migration summary report
+    """
+    print("=" * 60)
+    print("📋 MIGRATION REPORT")
+    print("=" * 60)
+    
+    # Collect statistics from XComs
+    total_records = context['ti'].xcom_pull(task_ids='extract_employees', key='total_records')
+    dept_count = context['ti'].xcom_pull(task_ids='extract_departments', key='department_count')
+    job_count = context['ti'].xcom_pull(task_ids='extract_job_codes', key='job_codes_count')
+    
+    print(f"Employee records migrated: {total_records:,}")
+    print(f"Departments: {dept_count}")
+    print(f"Job codes: {job_count}")
+    print("\n✅ Migration completed successfully!")
+    print("=" * 60)
+    
+    report = {
+        'total_records': total_records,
+        'departments': dept_count,
+        'job_codes': job_count,
+        'status': 'SUCCESS'
+    }
+    
+    return report
+
+generate_report = PythonOperator(
+    task_id='generate_report',
+    python_callable=generate_migration_report,
+    dag=dag
+)
+
+send_email = EmailOperator(
+    task_id='send_notification',
+    to=['hr-team@stanford.edu'],
+    subject='✅ HR Migration Completed - PeopleSoft to Redshift',
+    html_content="""
+    <h2>HR Data Migration Completed Successfully</h2>
+    <p>The 10-year HR data migration has been completed.</p>
+    <ul>
+        <li>Employee records: {{ ti.xcom_pull(task_ids='extract_employees', key='total_records') | format_number }}</li>
+        <li>Departments: {{ ti.xcom_pull(task_ids='extract_departments', key='department_count') }}</li>
+        <li>Job codes: {{ ti.xcom_pull(task_ids='extract_job_codes', key='job_codes_count') }}</li>
+    </ul>
+    <p>Tableau dashboards have been refreshed and are ready to use.</p>
+    """,
+    dag=dag
+)
+
+# ========================================
+# Define Task Dependencies
+# ========================================
+
+chain(
+    # Phase 1: Extract (3 parallel tasks)
+    [extract_employees, extract_departments, extract_jobs],
+    
+    # Phase 2: Validate Bronze (1 task)
+    validate_bronze,
+    
+    # Phase 3: Load Bronze (3 parallel tasks)
+    [load_bronze_employees, load_bronze_departments, load_bronze_jobs],
+    
+    # Phase 4: Create Silver (3 parallel tasks)
+    [create_silver_employees, create_silver_departments, create_silver_jobs],
+    
+    # Phase 5: Create Gold (2 parallel tasks)
+    [create_gold_employee_summary, create_gold_department_metrics],
+    
+    # Phase 6: Validate Gold (1 task)
+    validate_gold,
+    
+    # Phase 7: Tableau (2 sequential tasks)
+    create_tableau_views,
+    refresh_tableau,
+    
+    # Phase 8: Reporting (2 sequential tasks)
+    generate_report,
+    send_email
+)
+
+"""
+========================================
+DAG SUMMARY
+========================================
+
+Total Tasks: 17
+
+Phase 1 - Extract (3 parallel):
+  - extract_employees
+  - extract_departments  
+  - extract_job_codes
+
+Phase 2 - Validate (1):
+  - validate_bronze
+
+Phase 3 - Load Bronze (3 parallel):
+  - load_bronze_employees
+  - load_bronze_departments
+  - load_bronze_jobs
+
+Phase 4 - Silver (3 parallel):
+  - create_silver_employees
+  - create_silver_departments
+  - create_silver_job_codes
+
+Phase 5 - Gold (2 parallel):
+  - create_gold_employee_summary
+  - create_gold_department_metrics
+
+Phase 6 - Validate (1):
+  - validate_gold
+
+Phase 7 - Tableau (2 sequential):
+  - create_tableau_views
+  - refresh_tableau
+
+Phase 8 - Report (2 sequential):
+  - generate_report
+  - send_notification
+
+========================================
+KEY LEARNING POINTS
+========================================
+
+1. Medallion Architecture:
+   Bronze (raw) → Silver (cleaned) → Gold (analytics)
+
+2. Parallel Tasks:
+   Use [task1, task2, task3] for simultaneous execution
+
+3. XComs:
+   Pass data between tasks using xcom_push/xcom_pull
+
+4. Task Dependencies:
+   Use chain() for clear, linear workflow definition
+
+5. Operators:
+   - PythonOperator: Python functions
+   - PostgresOperator: SQL queries
+   - S3ToRedshiftOperator: Data loading
+   - BashOperator: Shell commands
+   - EmailOperator: Notifications
+
+6. Best Practices:
+   - Set default_args for retry logic
+   - Use catchup=False for one-time jobs
+   - Add data quality checks
+   - Include monitoring and alerts
+========================================
+"""
